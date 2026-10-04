@@ -3,6 +3,7 @@
 # Resumable: if the job is killed or hits the time limit, submit it again and finished seeds are skipped.
 # Smoke test:  sbatch scripts/slurm_evaluate.sh --population_size 3 --out_dir logs/smoke
 #SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH -t 1-00:00:00
 #SBATCH -o slurm_%j.log

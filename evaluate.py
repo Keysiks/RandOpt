@@ -158,7 +158,12 @@ class SingleEngine:
         os.environ["VLLM_NO_USAGE_STATS"] = "1"
         # Ray workers must be able to import utils.worker_extn from the repo root.
         os.environ["PYTHONPATH"] = REPO_ROOT + os.pathsep + os.environ.get("PYTHONPATH", "")
-        ray.init(address="local", ignore_reinit_error=True)
+        # Without num_cpus Ray starts one idle worker per core of the whole node, which starves
+        # a Slurm job that was given only a few cores.
+        num_cpus = int(os.environ.get("SLURM_CPUS_PER_TASK") or min(os.cpu_count() or 1, 8))
+        ray.init(address="local", num_cpus=num_cpus, ignore_reinit_error=True)
+        log.info(f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')} "
+                 f"ray resources={ray.cluster_resources()}")
         t0 = time.perf_counter()
         self.engines, self.pgs = launch_engines(
             1, args.model_name, precision=args.precision, tensor_parallel_size=1,
