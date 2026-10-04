@@ -16,7 +16,7 @@ class RandOptNcclLLM(LLM):
         super().__init__(*args, **kwargs)
 
 
-def launch_engines(num_engines: int, model_name: str, precision: str = "bfloat16", batch_size: int = 25, tensor_parallel_size: int = 1, enable_prefix_caching: bool = False, gpu_memory_utilization: float = 0.75, multimodal: bool = False, enforce_eager: bool = True):
+def launch_engines(num_engines: int, model_name: str, precision: str = "bfloat16", batch_size: int = 25, tensor_parallel_size: int = 1, enable_prefix_caching: bool = False, gpu_memory_utilization: float = 0.75, multimodal: bool = False, enforce_eager: bool = True, max_num_seqs: int = None):
     """Launch vLLM engines on Ray with batched initialization.
     
     Args:
@@ -28,6 +28,7 @@ def launch_engines(num_engines: int, model_name: str, precision: str = "bfloat16
         multimodal: Whether to enable multimodal support (for VL models with images)
         enforce_eager: True disables torch.compile and CUDA graphs (default, original behaviour);
             False enables them for faster decoding
+        max_num_seqs: max sequences decoded concurrently per engine (None = vLLM default, 256 on A100)
     
     Returns:
         Tuple of (engines list, placement groups list)
@@ -110,6 +111,8 @@ def launch_engines(num_engines: int, model_name: str, precision: str = "bfloat16
             gpu_memory_utilization=gpu_memory_utilization,
             disable_log_stats=True,
         )
+        if max_num_seqs is not None:
+            engine_kwargs["max_num_seqs"] = max_num_seqs
         if multimodal:
             engine_kwargs["limit_mm_per_prompt"] = {"image": 1}
         

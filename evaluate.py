@@ -66,6 +66,9 @@ def parse_args():
     p.add_argument("--cuda_devices", default=None,
                    help="default: keep CUDA_VISIBLE_DEVICES from the environment (e.g. set by Slurm), else \"0\"")
     p.add_argument("--out_dir", default="logs/math500_qwen2.5-3b-instruct_n500")
+    p.add_argument("--max_num_seqs", type=int, default=None,
+                   help="max concurrently decoded sequences in vLLM (default: vLLM default, 256 on A100); "
+                        "set >= number of problems so all of them run in one wave")
     p.add_argument("--cuda_graphs", action="store_true",
                    help="enable torch.compile + CUDA graphs in vLLM (faster decoding; the repo default is eager)")
     p.add_argument("--max_new_seeds", type=int, default=None,
@@ -171,7 +174,8 @@ class SingleEngine:
         t0 = time.perf_counter()
         self.engines, self.pgs = launch_engines(
             1, args.model_name, precision=args.precision, tensor_parallel_size=1,
-            gpu_memory_utilization=args.gpu_memory_utilization, enforce_eager=not args.cuda_graphs)
+            gpu_memory_utilization=args.gpu_memory_utilization, enforce_eager=not args.cuda_graphs,
+            max_num_seqs=args.max_num_seqs)
         self.launch_s = time.perf_counter() - t0
         self.engine = self.engines[0]
 
