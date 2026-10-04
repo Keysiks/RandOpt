@@ -31,6 +31,7 @@ import json
 import logging
 import os
 import statistics
+import subprocess
 import sys
 import time
 from collections import Counter
@@ -72,18 +73,32 @@ def parse_args():
     p.add_argument("--cuda_graphs", action="store_true",
                    help="enable torch.compile + CUDA graphs in vLLM (faster decoding; the repo default is eager)")
     p.add_argument("--max_new_seeds", type=int, default=None,
-                   help="stop after running this many new seeds (for quick checks)")
+                   help="stop after running this many new seeds, per process (for quick checks)")
+    p.add_argument("--engine", choices=["ray", "direct"], default="ray",
+                   help="ray: engine through core.engine (original). direct: plain vllm.LLM without Ray, "
+                        "the engine core runs in its own process")
+    p.add_argument("--procs_per_gpu", type=int, default=1,
+                   help="k>1 runs k direct-engine processes on the same GPU, process j takes the seeds with "
+                        "index %% k == j and gets gpu_memory_utilization/k (the copy of the base weights comes "
+                        "on top of that); implies --engine direct")
+    p.add_argument("--prefix_caching", action="store_true", help="direct engine only: vLLM prefix caching")
+    p.add_argument("--stagger_s", type=float, default=60.0,
+                   help="delay between starting processes when procs_per_gpu > 1 (vLLM memory profiling races otherwise)")
+    p.add_argument("--shard", default=None, help=argparse.SUPPRESS)  # \"j/k\", set for child processes
     p.add_argument("--aggregate_only", action="store_true",
                    help="do not launch vLLM, only rebuild summary.json from existing logs")
     args = p.parse_args()
+    if args.procs_per_gpu > 1:
+        args.engine = "direct"
     args.sigma_list = [float(s) for s in args.sigma_values.split(",")]
     args.top_k_list = sorted({int(k) for k in args.top_k.split(",")})
     return args
 
 
-def setup_logging(out_dir: str):
+def setup_logging(out_dir: str, shard: Optional[str] = None):
     log.setLevel(logging.INFO)
-    fmt = logging.Formatter("%(asctime)s %(message)s", "%H:%M:%S")
+    tag = f"[{shard}] " if shard else ""
+    fmt = logging.Formatter(f"%(asctime)s {tag}%(message)s", "%H:%M:%S")
     for h in (logging.StreamHandler(sys.stdout), logging.FileHandler(os.path.join(out_dir, "run.log"))):
         h.setFormatter(fmt)
         log.addHandler(h)
@@ -195,6 +210,93 @@ class SingleEngine:
         cleanup_engines(self.engines, self.pgs)
 
 
+class DirectEngine:
+    """Plain vllm.LLM without Ray (like evaluate_oleg_version.py): the engine core runs in its own
+    process, so tokenization and scheduling overlap with GPU work."""
+
+    def __init__(self, args):
+        from vllm import LLM
+
+        if args.cuda_devices is not None:
+            os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_devices
+        else:
+            os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+        os.environ["VLLM_NO_USAGE_STATS"] = "1"
+        os.environ["PYTHONPATH"] = REPO_ROOT + os.pathsep + os.environ.get("PYTHONPATH", "")
+        # FlashInfer's sampler JIT-compiles with the system nvcc and can fail on old toolkits;
+        # greedy decoding does not need it.
+        os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
+        extra = {} if args.max_num_seqs is None else {"max_num_seqs": args.max_num_seqs}
+        t0 = time.perf_counter()
+        self.llm = LLM(
+            model=args.model_name, dtype=args.precision,
+            worker_extension_cls="utils.worker_extn.WorkerExtension",
+            enforce_eager=not args.cuda_graphs,
+            gpu_memory_utilization=args.gpu_memory_utilization / args.procs_per_gpu,
+            enable_prefix_caching=args.prefix_caching, disable_log_stats=True, **extra)
+        self.llm.collective_rpc("store_base_weights")
+        self.prefix_caching = args.prefix_caching
+        self.launch_s = time.perf_counter() - t0
+
+    def perturb(self, seed: int, sigma: float):
+        self.llm.collective_rpc("apply_perturbation", args=(seed, sigma))
+        if self.prefix_caching:
+            self.llm.reset_prefix_cache()  # cached KV belongs to the previous weights
+
+    def reset(self):
+        self.llm.collective_rpc("reset_to_base_weights")
+
+    def generate(self, prompts, sampling_params):
+        return self.llm.generate(prompts, sampling_params, use_tqdm=False)
+
+    def close(self):
+        import gc
+        del self.llm
+        gc.collect()
+
+
+def make_engine(args):
+    return DirectEngine(args) if args.engine == "direct" else SingleEngine(args)
+
+
+def shard_pending(pending: List[int], shard: Optional[str]) -> List[int]:
+    """Process j of k takes the seeds with index % k == j. Depends only on the index, so the
+    split stays consistent although the processes start at different times."""
+    if not shard:
+        return pending
+    j, k = map(int, shard.split("/"))
+    return [i for i in pending if i % k == j]
+
+
+def run_children(args) -> List[int]:
+    """Start procs_per_gpu copies of this script (one shard each) and wait for them."""
+    children = []
+    for j in range(args.procs_per_gpu):
+        cmd = [sys.executable, os.path.join(REPO_ROOT, "evaluate.py"), *sys.argv[1:],
+               "--shard", f"{j}/{args.procs_per_gpu}"]
+        children.append(subprocess.Popen(cmd))
+        log.info(f"started process {j + 1}/{args.procs_per_gpu}")
+        if j + 1 < args.procs_per_gpu:
+            time.sleep(args.stagger_s)
+    return [c.wait() for c in children]
+
+
+def log_throughput(out_dir: str, indices: List[int]):
+    """Effective seconds per seed from the seed logs themselves (per-seed times are inflated when
+    processes share a GPU): window from the earliest seed start to the latest seed end."""
+    spans = []
+    for i in indices:
+        path = seed_path(out_dir, i)
+        if os.path.exists(path):
+            d = read_json(path)
+            if "finished_at" in d:
+                spans.append((d["finished_at"] - d["timing"]["total_s"], d["finished_at"]))
+    if len(spans) > 1:
+        window = max(e for _, e in spans) - min(s for s, _ in spans)
+        log.info(f"throughput: {len(spans)} new seeds in {window:.0f}s = {window / len(spans):.1f}s per seed "
+                 f"(from first seed start to last seed end, engine launch excluded)")
+
+
 # -----------------------------------------------------------------------------
 # One run = one seed (or the base model) on all problems
 # -----------------------------------------------------------------------------
@@ -218,6 +320,7 @@ def run_one(engine, handler, prompts, datas, sampling_params, train_samples: int
     return {
         "seed": seed,
         "sigma": sigma,
+        "finished_at": time.time(),
         "train_reward": float(np.mean([r["reward"] for r in records[:train_samples]])),
         "train_accuracy": float(np.mean(train)),
         "test_accuracy": float(np.mean(test)) if test else None,
@@ -335,7 +438,7 @@ def main(args):
 
     out_dir = args.out_dir
     os.makedirs(os.path.join(out_dir, "seeds"), exist_ok=True)
-    setup_logging(out_dir)
+    setup_logging(out_dir, args.shard)
 
     args_path = os.path.join(out_dir, "args.json")
     cfg = {k: v for k, v in vars(args).items() if k not in ("aggregate_only",)}
@@ -353,19 +456,32 @@ def main(args):
     handler = get_dataset_handler("math500")
     datas, splits = load_problems(handler, args)
     log.info(f"{len(datas)} problems: {splits.count('train')} train / {splits.count('test')} test")
-    write_json(os.path.join(out_dir, "problems.json"), [
-        {"idx": i, "split": splits[i], "problem": d["problem"], "ground_truth": d["ground_truth"],
-         "subject": d["subject"], "level": d["level"]} for i, d in enumerate(datas)])
+    if not args.shard:  # child processes must not race on this file
+        write_json(os.path.join(out_dir, "problems.json"), [
+            {"idx": i, "split": splits[i], "problem": d["problem"], "ground_truth": d["ground_truth"],
+             "subject": d["subject"], "level": d["level"]} for i, d in enumerate(datas)])
 
     population = make_population(args.population_size, args.sigma_list, args.global_seed)
     base_path = os.path.join(out_dir, "base.json")
     pending = [i for i, (s, sg) in enumerate(population) if not log_is_valid(seed_path(out_dir, i), s, sg)]
     need_base = not log_is_valid(base_path, None, 0.0)
-    if args.max_new_seeds is not None:
+    spawn_children = args.procs_per_gpu > 1 and not args.shard and not args.aggregate_only
+    if args.shard:
+        pending = shard_pending(pending, args.shard)
+        need_base = need_base and args.shard.startswith("0/")
+    if args.max_new_seeds is not None:  # per process
         pending = pending[:args.max_new_seeds]
     log.info(f"{len(population) - len(pending)} seeds already done, {len(pending)} to run")
 
-    if not args.aggregate_only and (pending or need_base):
+    if spawn_children and (pending or need_base):
+        t_start = time.perf_counter()
+        codes = run_children(args)
+        wall = time.perf_counter() - t_start
+        log.info(f"all {args.procs_per_gpu} processes finished (exit codes {codes}) in {wall:.0f}s wall")
+        log_throughput(out_dir, pending)
+        if any(codes):
+            log.warning("some processes failed; the summary covers the finished seeds, rerun to continue")
+    elif not args.aggregate_only and (pending or need_base):
         from transformers import AutoTokenizer
         from vllm import SamplingParams
 
@@ -375,13 +491,13 @@ def main(args):
         sampling_params = SamplingParams(temperature=0.0, seed=args.global_seed, max_tokens=args.max_tokens)
 
         t_start = time.perf_counter()
-        engine = SingleEngine(args)
+        engine = make_engine(args)
         log.info(f"engine launched in {engine.launch_s:.1f}s")
         try:
             # The base run also warms the engine up, so it is not charged to seed 0.
             if need_base:
                 res = run_one(engine, handler, prompts, datas, sampling_params, args.train_samples, None, 0.0)
-                res["cuda_graphs"] = args.cuda_graphs
+                res.update(cuda_graphs=args.cuda_graphs, engine=args.engine, procs_per_gpu=args.procs_per_gpu)
                 write_json(base_path, res)
                 log.info(f"base: train_reward={res['train_reward']:.4f} test_acc={res['test_accuracy']:.4f} "
                          f"time={res['timing']['total_s']:.1f}s")
@@ -391,7 +507,7 @@ def main(args):
                 seed, sigma = population[i]
                 res = run_one(engine, handler, prompts, datas, sampling_params, args.train_samples, seed, sigma)
                 res["index"] = i
-                res["cuda_graphs"] = args.cuda_graphs
+                res.update(cuda_graphs=args.cuda_graphs, engine=args.engine, procs_per_gpu=args.procs_per_gpu)
                 write_json(seed_path(out_dir, i), res)
                 elapsed = time.perf_counter() - loop_start
                 eta = elapsed / (n_done + 1) * (len(pending) - n_done - 1)
@@ -406,6 +522,9 @@ def main(args):
         log.info(f"this invocation: {wall:.0f}s wall ({wall / 3600:.2f}h) incl. engine launch")
     else:
         wall = None
+
+    if args.shard:  # child process: the parent writes the summary
+        return
 
     summary = aggregate(handler, args, datas, out_dir)
     summary["this_invocation_wall_s"] = wall
