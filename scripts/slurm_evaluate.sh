@@ -10,5 +10,6 @@
 cd "${SLURM_SUBMIT_DIR:-$(dirname "$0")/..}"
 source .venv/bin/activate
 export VLLM_NO_USAGE_STATS=1
+export PYTHONUNBUFFERED=1
 
 python evaluate.py "$@"
