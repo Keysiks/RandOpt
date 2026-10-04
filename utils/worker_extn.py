@@ -212,11 +212,25 @@ class WorkerExtension:
     
     # ==================== Ensemble Methods ====================
     
-    def store_base_weights(self):
-        """Store a copy of current weights as base weights for ensemble."""
+    def store_base_weights(self, cpu=False):
+        """Store a copy of current weights as base weights for ensemble.
+
+        cpu=True keeps the copy in host memory (pinned when the system allows it), so a model that
+        barely fits on the GPU does not need twice its size there; resets then copy host -> device.
+        """
         self._base_weights = {}
+        pin = bool(cpu)
         for name, p in self.model_runner.model.named_parameters():
-            self._base_weights[name] = p.data.clone()
+            if not cpu:
+                self._base_weights[name] = p.data.clone()
+                continue
+            try:
+                buf = torch.empty(p.shape, dtype=p.dtype, device="cpu", pin_memory=pin)
+            except RuntimeError:  # pinned-memory limit reached: fall back to pageable memory
+                pin = False
+                buf = torch.empty(p.shape, dtype=p.dtype, device="cpu")
+            buf.copy_(p.data)
+            self._base_weights[name] = buf
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         return True

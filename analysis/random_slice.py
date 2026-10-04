@@ -147,8 +147,7 @@ def evaluate_grid(args):
         return
 
     handler = get_dataset_handler("math500")
-    ns = types.SimpleNamespace(data_path=args.data_path, train_samples=args.train_samples)
-    datas, _ = ev.load_problems(handler, ns)
+    datas, _ = ev.load_problems(handler, args.data_path, args.data_path, args.train_samples)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     prompts = [tokenizer.apply_chat_template(d["messages"], add_generation_prompt=True, tokenize=False)
                for d in datas]
@@ -161,7 +160,8 @@ def evaluate_grid(args):
     engine = SliceEngine(types.SimpleNamespace(
         cuda_devices=args.cuda_devices, model_name=args.model_name, precision="bfloat16",
         max_num_seqs=args.max_num_seqs, cuda_graphs=args.cuda_graphs, prefix_caching=False,
-        gpu_memory_utilization=args.gpu_memory_utilization, procs_per_gpu=shard_k))
+        gpu_memory_utilization=args.gpu_memory_utilization, procs_per_gpu=shard_k,
+        tp=args.tp, base_on_cpu=args.base_on_cpu, max_model_len=None))
     try:
         for n, (ia, ib) in enumerate(todo, 1):
             a, b = axis[ia], axis[ib]
@@ -305,6 +305,8 @@ def parse_args():
     p.add_argument("--max_tokens", type=int, default=1024)
     p.add_argument("--cuda_graphs", action="store_true")
     p.add_argument("--max_num_seqs", type=int, default=None)
+    p.add_argument("--tp", type=int, default=1, help="tensor parallel size")
+    p.add_argument("--base_on_cpu", action="store_true", help="keep the base-weights copy in host RAM")
     p.add_argument("--gpu_memory_utilization", type=float, default=0.75)
     p.add_argument("--cuda_devices", default=None)
     p.add_argument("--shard", default=None, help="j/k: this process evaluates every k-th grid point")

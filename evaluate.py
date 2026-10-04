@@ -1,29 +1,33 @@
 #!/usr/bin/env python3
 """
-RandOpt on MATH-500 with per-seed timing and per-seed answer logs (single GPU, vLLM).
+RandOpt with per-seed timing and per-seed answer logs (vLLM, one or several GPUs).
 
 Protocol (Neural Thickets, arXiv:2603.12228):
   - N random perturbations theta' = theta + sigma * eps(seed), eps ~ N(0, I) on ALL parameters,
     sigma sampled uniformly from {1e-3, 2e-3, 3e-3} (Table 3), bf16, max length 1024.
-  - MATH-500: first 200 problems = train (selection), remaining 300 = test.
+  - Selection on the train problems, evaluation on the test problems. MATH-500 (one file): the first
+    200 problems are train, the rest (300) test. Datasets with separate files (GSM8K): the first
+    --train_samples of the train file are train, --test_samples of the test file are test.
   - Top-K seeds by train reward, majority vote over their test answers.
 
-Every seed is evaluated on ALL 500 problems and the full model responses are written to
-<out_dir>/seeds/seed_XXXX.json together with timings, so selection / voting for any K can be
-recomputed from the logs without generating again. Re-running the same command resumes:
-seeds that already have a log are skipped.
+Every seed is evaluated on ALL problems of every dataset (--dataset a,b runs several datasets in one
+pass with the same seeds) and the full model responses are written to <dir>/seeds/seed_XXXX.json
+together with timings, so selection / voting for any K can be recomputed from the logs without
+generating again. Re-running the same command resumes: seeds that already have a log are skipped.
 
-Output layout:
+Output layout (<dir> is out_dir for one dataset, out_dir/<dataset> for several):
   <out_dir>/args.json            run configuration
-  <out_dir>/problems.json        problems, ground truths, train/test split
   <out_dir>/run.log              console log
-  <out_dir>/base.json            sigma=0 (base model) run, same format as a seed log
-  <out_dir>/seeds/seed_XXXX.json one log per perturbation (timings + all responses)
-  <out_dir>/summary.json         timings (one seed / all seeds) and ensemble accuracy
+  <dir>/problems.json            problems, ground truths, train/test split
+  <dir>/base.json                sigma=0 (base model) run, same format as a seed log
+  <dir>/seeds/seed_XXXX.json     one log per perturbation (timings + all responses)
+  <dir>/summary.json             timings (one seed / all seeds) and ensemble accuracy
 
-Usage (from the repo root):
-  python evaluate.py          # on a shared cluster run it through Slurm, see scripts/slurm_evaluate.sh
-  python evaluate.py --aggregate_only        # recompute summary.json from existing logs
+Usage (from the repo root; on a shared cluster run through Slurm, see scripts/):
+  python evaluate.py                              # Qwen2.5-3B-Instruct, MATH-500, 500 seeds
+  python evaluate.py --aggregate_only             # recompute summary.json from existing logs
+  python evaluate.py --model_name Qwen/Qwen2.5-32B-Instruct --tp 2 --base_on_cpu \
+      --dataset math500,gsm8k --test_samples 500
 """
 
 import argparse
@@ -44,7 +48,9 @@ log = logging.getLogger("evaluate")
 
 # Keys of args.json that must match when resuming into an existing out_dir.
 RESUME_KEYS = ("model_name", "population_size", "sigma_values", "global_seed",
-               "max_tokens", "train_samples", "precision")
+               "max_tokens", "train_samples", "precision", "dataset", "tp", "test_samples")
+# values of keys that older args.json files do not have
+RESUME_DEFAULTS = {"dataset": "math500", "tp": 1, "test_samples": None}
 
 
 # -----------------------------------------------------------------------------
@@ -55,13 +61,23 @@ def parse_args():
     p = argparse.ArgumentParser(description="RandOpt MATH-500 evaluation with timing and logs",
                                 formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument("--model_name", default="Qwen/Qwen2.5-3B-Instruct")
-    p.add_argument("--data_path", default="data/math-500/test.jsonl")
+    p.add_argument("--dataset", default="math500",
+                   help="dataset name from data_handlers, or a comma list (e.g. math500,gsm8k) evaluated in one pass")
+    p.add_argument("--train_data_path", default=None, help="override the handler's train file (one dataset only)")
+    p.add_argument("--test_data_path", default=None, help="override the handler's test file (one dataset only)")
     p.add_argument("--train_samples", type=int, default=200, help="first N problems are used for selection")
+    p.add_argument("--test_samples", type=int, default=None,
+                   help="cap on test problems (None = all; for MATH-500 all means the 300 after the train ones)")
     p.add_argument("--population_size", type=int, default=500, help="number of seeds")
     p.add_argument("--sigma_values", default="0.001,0.002,0.003", help="sigma set from the paper (Table 3)")
     p.add_argument("--top_k", default="1,5,25,50", help="ensemble sizes for the summary")
     p.add_argument("--max_tokens", type=int, default=1024)
     p.add_argument("--precision", choices=["float16", "bfloat16"], default="bfloat16")
+    p.add_argument("--tp", type=int, default=1, help="tensor parallel size (GPUs per engine); implies --engine direct")
+    p.add_argument("--base_on_cpu", action="store_true",
+                   help="keep the copy of the base weights in host RAM instead of on the GPU (needed when the model "
+                        "barely fits, e.g. 32B on 2x80GB); implies --engine direct")
+    p.add_argument("--max_model_len", type=int, default=None, help="vLLM max_model_len (direct engine)")
     p.add_argument("--gpu_memory_utilization", type=float, default=0.75)
     p.add_argument("--global_seed", type=int, default=42)
     p.add_argument("--cuda_devices", default=None,
@@ -88,8 +104,11 @@ def parse_args():
     p.add_argument("--aggregate_only", action="store_true",
                    help="do not launch vLLM, only rebuild summary.json from existing logs")
     args = p.parse_args()
-    if args.procs_per_gpu > 1:
+    if args.procs_per_gpu > 1 and args.tp > 1:
+        p.error("--procs_per_gpu > 1 cannot be combined with --tp > 1")
+    if args.procs_per_gpu > 1 or args.tp > 1 or args.base_on_cpu:
         args.engine = "direct"
+    args.dataset_list = [n.strip() for n in args.dataset.split(",") if n.strip()]
     args.sigma_list = [float(s) for s in args.sigma_values.split(",")]
     args.top_k_list = sorted({int(k) for k in args.top_k.split(",")})
     return args
@@ -125,9 +144,36 @@ def make_population(n: int, sigmas: List[float], global_seed: int):
     return [(int(s), float(sg)) for s, sg in zip(seeds, sigma_per_seed)]
 
 
-def load_problems(handler, args):
-    datas = handler.load_data(args.data_path, split="train", max_samples=None)
-    return datas, [("train" if i < args.train_samples else "test") for i in range(len(datas))]
+def load_problems(handler, train_path, test_path, train_samples, test_samples=None):
+    """Train problems first, then test problems (same rules as randopt.py). Returns (datas, splits)."""
+    if train_path == test_path:  # one file (MATH-500): split by index
+        all_data = handler.load_data(train_path, split="train", max_samples=None)
+        train = all_data[:train_samples]
+        test = all_data[train_samples:] if test_samples is None else all_data[train_samples:train_samples + test_samples]
+    else:
+        train = handler.load_data(train_path, split="train", max_samples=train_samples)
+        test = handler.load_data(test_path, split="test", max_samples=test_samples)
+    return train + test, ["train"] * len(train) + ["test"] * len(test)
+
+
+class Bench:
+    """One dataset of a run: its problems, the train/test split and where its logs go."""
+
+    def __init__(self, name, handler, datas, splits, directory):
+        self.name, self.handler, self.datas, self.splits, self.dir = name, handler, datas, splits, directory
+        self.n_train = splits.count("train")
+
+
+def load_bench(name: str, args, root: str, multi: bool) -> Bench:
+    from data_handlers import get_dataset_handler
+
+    handler = get_dataset_handler(name)
+    train_path = (None if multi else args.train_data_path) or handler.default_train_path
+    test_path = (None if multi else args.test_data_path) or handler.default_test_path
+    datas, splits = load_problems(handler, train_path, test_path, args.train_samples, args.test_samples)
+    directory = os.path.join(root, name) if multi else root
+    os.makedirs(os.path.join(directory, "seeds"), exist_ok=True)
+    return Bench(name, handler, datas, splits, directory)
 
 
 # -----------------------------------------------------------------------------
@@ -227,14 +273,16 @@ class DirectEngine:
         # greedy decoding does not need it.
         os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
         extra = {} if args.max_num_seqs is None else {"max_num_seqs": args.max_num_seqs}
+        if getattr(args, "max_model_len", None) is not None:
+            extra["max_model_len"] = args.max_model_len
         t0 = time.perf_counter()
         self.llm = LLM(
-            model=args.model_name, dtype=args.precision,
+            model=args.model_name, dtype=args.precision, tensor_parallel_size=getattr(args, "tp", 1),
             worker_extension_cls="utils.worker_extn.WorkerExtension",
             enforce_eager=not args.cuda_graphs,
             gpu_memory_utilization=args.gpu_memory_utilization / args.procs_per_gpu,
             enable_prefix_caching=args.prefix_caching, disable_log_stats=True, **extra)
-        self.llm.collective_rpc("store_base_weights")
+        self.llm.collective_rpc("store_base_weights", args=(bool(getattr(args, "base_on_cpu", False)),))
         self.prefix_caching = args.prefix_caching
         self.launch_s = time.perf_counter() - t0
 
@@ -301,40 +349,53 @@ def log_throughput(out_dir: str, indices: List[int]):
 # One run = one seed (or the base model) on all problems
 # -----------------------------------------------------------------------------
 
-def run_one(engine, handler, prompts, datas, sampling_params, train_samples: int,
-            seed: Optional[int], sigma: float) -> dict:
+def run_one(engine, benches, prompts, sampling_params, seed: Optional[int], sigma: float) -> dict:
+    """One generate() call over the prompts of all datasets; returns {dataset name: result log}.
+
+    apply_perturbation always starts from the stored base weights, so no reset is needed afterwards."""
     t0 = time.perf_counter()
     if seed is not None:
         engine.perturb(seed, sigma)
     t1 = time.perf_counter()
     outputs = engine.generate(prompts, sampling_params)
     t2 = time.perf_counter()
-    if seed is not None:
-        engine.reset()
-    t3 = time.perf_counter()
 
-    records = build_records(handler, outputs, datas)
-    n_tokens = sum(r["n_tokens"] for r in records)
-    train = [r["correct"] for r in records[:train_samples]]
-    test = [r["correct"] for r in records[train_samples:]]
-    return {
-        "seed": seed,
-        "sigma": sigma,
-        "finished_at": time.time(),
-        "train_reward": float(np.mean([r["reward"] for r in records[:train_samples]])),
-        "train_accuracy": float(np.mean(train)),
-        "test_accuracy": float(np.mean(test)) if test else None,
-        "full_accuracy": float(np.mean([r["correct"] for r in records])),
-        "timing": {
-            "perturb_s": t1 - t0,
-            "generate_s": t2 - t1,
-            "reset_s": t3 - t2,
-            "total_s": t3 - t0,
-            "n_tokens": n_tokens,
-            "tokens_per_s": n_tokens / (t2 - t1) if t2 > t1 else None,
-        },
-        "records": records,
-    }
+    per_bench, start = {}, 0
+    for b in benches:
+        per_bench[b.name] = build_records(b.handler, outputs[start:start + len(b.datas)], b.datas)
+        start += len(b.datas)
+    n_tokens_all = sum(r["n_tokens"] for recs in per_bench.values() for r in recs)
+
+    results = {}
+    for b in benches:
+        records, ts = per_bench[b.name], b.n_train
+        train = [r["correct"] for r in records[:ts]]
+        test = [r["correct"] for r in records[ts:]]
+        n_tokens = sum(r["n_tokens"] for r in records)
+        results[b.name] = {
+            "seed": seed,
+            "sigma": sigma,
+            "finished_at": time.time(),
+            "train_reward": float(np.mean([r["reward"] for r in records[:ts]])),
+            "train_accuracy": float(np.mean(train)),
+            "test_accuracy": float(np.mean(test)) if test else None,
+            "full_accuracy": float(np.mean([r["correct"] for r in records])),
+            "timing": {
+                "perturb_s": t1 - t0,
+                "generate_s": t2 - t1,  # one call for all datasets of the run
+                "total_s": t2 - t0,
+                "n_tokens": n_tokens,
+                "tokens_per_s": n_tokens_all / (t2 - t1) if t2 > t1 else None,
+                "datasets_in_call": [x.name for x in benches],
+            },
+            "records": records,
+        }
+    return results
+
+
+def run_meta(args, name: str) -> dict:
+    return dict(cuda_graphs=args.cuda_graphs, engine=args.engine, procs_per_gpu=args.procs_per_gpu,
+                tp=args.tp, dataset=name)
 
 
 def seed_path(out_dir: str, i: int) -> str:
@@ -359,8 +420,8 @@ def stats(xs: List[float]) -> dict:
     return {"mean": statistics.fmean(xs), "median": statistics.median(xs), "min": min(xs), "max": max(xs)}
 
 
-def aggregate(handler, args, datas, out_dir: str) -> dict:
-    ts = args.train_samples
+def aggregate(handler, args, datas, out_dir: str, n_train: int) -> dict:
+    ts = n_train
     seeds = []
     for i in range(args.population_size):
         path = seed_path(out_dir, i)
@@ -411,9 +472,9 @@ def aggregate(handler, args, datas, out_dir: str) -> dict:
     return summary
 
 
-def print_summary(summary: dict):
+def print_summary(summary: dict, name: str = ""):
     log.info("=" * 60)
-    log.info(f"SUMMARY: {summary['n_seeds_done']}/{summary['n_seeds_total']} seeds")
+    log.info(f"SUMMARY{' ' + name if name else ''}: {summary['n_seeds_done']}/{summary['n_seeds_total']} seeds")
     if "base" in summary:
         b = summary["base"]
         log.info(f"base: train_reward={b['train_reward']:.4f} test_acc={b['test_accuracy']:.4f} "
@@ -434,17 +495,20 @@ def print_summary(summary: dict):
 
 def main(args):
     os.chdir(REPO_ROOT)
-    from data_handlers import get_dataset_handler
 
     out_dir = args.out_dir
-    os.makedirs(os.path.join(out_dir, "seeds"), exist_ok=True)
+    os.makedirs(out_dir, exist_ok=True)
     setup_logging(out_dir, args.shard)
+    names = args.dataset_list
+    multi = len(names) > 1
+    if multi and (args.train_data_path or args.test_data_path):
+        sys.exit("--train_data_path / --test_data_path work with a single --dataset only")
 
     args_path = os.path.join(out_dir, "args.json")
-    cfg = {k: v for k, v in vars(args).items() if k not in ("aggregate_only",)}
+    cfg = {k: v for k, v in vars(args).items() if k not in ("aggregate_only", "dataset_list")}
     if os.path.exists(args_path):
         prev = read_json(args_path)
-        diff = [k for k in RESUME_KEYS if prev.get(k) != cfg.get(k)]
+        diff = [k for k in RESUME_KEYS if prev.get(k, RESUME_DEFAULTS.get(k)) != cfg.get(k)]
         if prev.get("cuda_graphs", False) != args.cuda_graphs:
             log.warning(f"{out_dir} was started with cuda_graphs={prev.get('cuda_graphs', False)}, "
                         f"now cuda_graphs={args.cuda_graphs}: timings in summary mix both modes")
@@ -453,18 +517,26 @@ def main(args):
     else:
         write_json(args_path, cfg)
 
-    handler = get_dataset_handler("math500")
-    datas, splits = load_problems(handler, args)
-    log.info(f"{len(datas)} problems: {splits.count('train')} train / {splits.count('test')} test")
-    if not args.shard:  # child processes must not race on this file
-        write_json(os.path.join(out_dir, "problems.json"), [
-            {"idx": i, "split": splits[i], "problem": d["problem"], "ground_truth": d["ground_truth"],
-             "subject": d["subject"], "level": d["level"]} for i, d in enumerate(datas)])
+    benches = [load_bench(n, args, out_dir, multi) for n in names]
+    for b in benches:
+        log.info(f"{b.name}: {len(b.datas)} problems: {b.n_train} train / {len(b.datas) - b.n_train} test")
+        if not args.shard:  # child processes must not race on this file
+            write_json(os.path.join(b.dir, "problems.json"), [
+                {"idx": i, "split": b.splits[i],
+                 "problem": d.get("problem") or d["messages"][-1]["content"],
+                 "ground_truth": d["ground_truth"], "subject": d.get("subject", ""), "level": d.get("level", "")}
+                for i, d in enumerate(b.datas)])
 
     population = make_population(args.population_size, args.sigma_list, args.global_seed)
-    base_path = os.path.join(out_dir, "base.json")
-    pending = [i for i, (s, sg) in enumerate(population) if not log_is_valid(seed_path(out_dir, i), s, sg)]
-    need_base = not log_is_valid(base_path, None, 0.0)
+
+    def seed_ok(b, i):
+        return log_is_valid(seed_path(b.dir, i), *population[i])
+
+    def base_ok(b):
+        return log_is_valid(os.path.join(b.dir, "base.json"), None, 0.0)
+
+    pending = [i for i in range(len(population)) if not all(seed_ok(b, i) for b in benches)]
+    need_base = not all(base_ok(b) for b in benches)
     spawn_children = args.procs_per_gpu > 1 and not args.shard and not args.aggregate_only
     if args.shard:
         pending = shard_pending(pending, args.shard)
@@ -478,7 +550,7 @@ def main(args):
         codes = run_children(args)
         wall = time.perf_counter() - t_start
         log.info(f"all {args.procs_per_gpu} processes finished (exit codes {codes}) in {wall:.0f}s wall")
-        log_throughput(out_dir, pending)
+        log_throughput(benches[0].dir, pending)
         if any(codes):
             log.warning("some processes failed; the summary covers the finished seeds, rerun to continue")
     elif not args.aggregate_only and (pending or need_base):
@@ -487,7 +559,7 @@ def main(args):
 
         tokenizer = AutoTokenizer.from_pretrained(args.model_name)
         prompts = [tokenizer.apply_chat_template(d["messages"], add_generation_prompt=True, tokenize=False)
-                   for d in datas]
+                   for b in benches for d in b.datas]
         sampling_params = SamplingParams(temperature=0.0, seed=args.global_seed, max_tokens=args.max_tokens)
 
         t_start = time.perf_counter()
@@ -496,24 +568,32 @@ def main(args):
         try:
             # The base run also warms the engine up, so it is not charged to seed 0.
             if need_base:
-                res = run_one(engine, handler, prompts, datas, sampling_params, args.train_samples, None, 0.0)
-                res.update(cuda_graphs=args.cuda_graphs, engine=args.engine, procs_per_gpu=args.procs_per_gpu)
-                write_json(base_path, res)
-                log.info(f"base: train_reward={res['train_reward']:.4f} test_acc={res['test_accuracy']:.4f} "
-                         f"time={res['timing']['total_s']:.1f}s")
+                results = run_one(engine, benches, prompts, sampling_params, None, 0.0)
+                for b in benches:
+                    res = results[b.name]
+                    res.update(run_meta(args, b.name))
+                    if not base_ok(b):  # keep logs that are already valid
+                        write_json(os.path.join(b.dir, "base.json"), res)
+                    log.info(f"base {b.name}: train_reward={res['train_reward']:.4f} "
+                             f"test_acc={res['test_accuracy']:.4f} time={res['timing']['total_s']:.1f}s")
 
             loop_start = time.perf_counter()
             for n_done, i in enumerate(pending):
                 seed, sigma = population[i]
-                res = run_one(engine, handler, prompts, datas, sampling_params, args.train_samples, seed, sigma)
-                res["index"] = i
-                res.update(cuda_graphs=args.cuda_graphs, engine=args.engine, procs_per_gpu=args.procs_per_gpu)
-                write_json(seed_path(out_dir, i), res)
+                results = run_one(engine, benches, prompts, sampling_params, seed, sigma)
+                for b in benches:
+                    if seed_ok(b, i):  # keep logs that are already valid
+                        continue
+                    res = results[b.name]
+                    res["index"] = i
+                    res.update(run_meta(args, b.name))
+                    write_json(seed_path(b.dir, i), res)
                 elapsed = time.perf_counter() - loop_start
                 eta = elapsed / (n_done + 1) * (len(pending) - n_done - 1)
-                t = res["timing"]
-                log.info(f"[{i + 1}/{len(population)}] seed={seed} sigma={sigma} "
-                         f"train={res['train_reward']:.3f} test={res['test_accuracy']:.3f} "
+                t = results[benches[0].name]["timing"]
+                scores = " | ".join(f"{b.name} train={results[b.name]['train_reward']:.3f} "
+                                    f"test={results[b.name]['test_accuracy']:.3f}" for b in benches)
+                log.info(f"[{i + 1}/{len(population)}] seed={seed} sigma={sigma} {scores} "
                          f"time={t['total_s']:.1f}s (perturb {t['perturb_s']:.1f} / gen {t['generate_s']:.1f}) "
                          f"elapsed={elapsed / 60:.1f}m eta={eta / 60:.1f}m")
         finally:
@@ -526,10 +606,12 @@ def main(args):
     if args.shard:  # child process: the parent writes the summary
         return
 
-    summary = aggregate(handler, args, datas, out_dir)
-    summary["this_invocation_wall_s"] = wall
-    write_json(os.path.join(out_dir, "summary.json"), summary)
-    print_summary(summary)
+    for b in benches:
+        summary = aggregate(b.handler, args, b.datas, b.dir, b.n_train)
+        summary["dataset"] = b.name
+        summary["this_invocation_wall_s"] = wall
+        write_json(os.path.join(b.dir, "summary.json"), summary)
+        print_summary(summary, b.name)
 
 
 if __name__ == "__main__":
