@@ -22,7 +22,7 @@ Output layout:
   <out_dir>/summary.json         timings (one seed / all seeds) and ensemble accuracy
 
 Usage (from the repo root):
-  python evaluate.py --cuda_devices 0
+  python evaluate.py          # on a shared cluster run it through Slurm, see scripts/slurm_evaluate.sh
   python evaluate.py --aggregate_only        # recompute summary.json from existing logs
 """
 
@@ -63,7 +63,8 @@ def parse_args():
     p.add_argument("--precision", choices=["float16", "bfloat16"], default="bfloat16")
     p.add_argument("--gpu_memory_utilization", type=float, default=0.75)
     p.add_argument("--global_seed", type=int, default=42)
-    p.add_argument("--cuda_devices", default="0")
+    p.add_argument("--cuda_devices", default=None,
+                   help="default: keep CUDA_VISIBLE_DEVICES from the environment (e.g. set by Slurm), else \"0\"")
     p.add_argument("--out_dir", default="logs/math500_qwen2.5-3b-instruct_n500")
     p.add_argument("--aggregate_only", action="store_true",
                    help="do not launch vLLM, only rebuild summary.json from existing logs")
@@ -150,7 +151,10 @@ class SingleEngine:
         from core import launch_engines
 
         self.ray = ray
-        os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_devices
+        if args.cuda_devices is not None:
+            os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_devices
+        else:
+            os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
         os.environ["VLLM_NO_USAGE_STATS"] = "1"
         # Ray workers must be able to import utils.worker_extn from the repo root.
         os.environ["PYTHONPATH"] = REPO_ROOT + os.pathsep + os.environ.get("PYTHONPATH", "")
