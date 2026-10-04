@@ -66,6 +66,10 @@ def parse_args():
     p.add_argument("--cuda_devices", default=None,
                    help="default: keep CUDA_VISIBLE_DEVICES from the environment (e.g. set by Slurm), else \"0\"")
     p.add_argument("--out_dir", default="logs/math500_qwen2.5-3b-instruct_n500")
+    p.add_argument("--cuda_graphs", action="store_true",
+                   help="enable torch.compile + CUDA graphs in vLLM (faster decoding; the repo default is eager)")
+    p.add_argument("--max_new_seeds", type=int, default=None,
+                   help="stop after running this many new seeds (for quick checks)")
     p.add_argument("--aggregate_only", action="store_true",
                    help="do not launch vLLM, only rebuild summary.json from existing logs")
     args = p.parse_args()
@@ -167,7 +171,7 @@ class SingleEngine:
         t0 = time.perf_counter()
         self.engines, self.pgs = launch_engines(
             1, args.model_name, precision=args.precision, tensor_parallel_size=1,
-            gpu_memory_utilization=args.gpu_memory_utilization)
+            gpu_memory_utilization=args.gpu_memory_utilization, enforce_eager=not args.cuda_graphs)
         self.launch_s = time.perf_counter() - t0
         self.engine = self.engines[0]
 
@@ -334,6 +338,9 @@ def main(args):
     if os.path.exists(args_path):
         prev = read_json(args_path)
         diff = [k for k in RESUME_KEYS if prev.get(k) != cfg.get(k)]
+        if prev.get("cuda_graphs", False) != args.cuda_graphs:
+            log.warning(f"{out_dir} was started with cuda_graphs={prev.get('cuda_graphs', False)}, "
+                        f"now cuda_graphs={args.cuda_graphs}: timings in summary mix both modes")
         if diff:
             sys.exit(f"{out_dir} was created with different {diff}; use another --out_dir")
     else:
@@ -350,6 +357,8 @@ def main(args):
     base_path = os.path.join(out_dir, "base.json")
     pending = [i for i, (s, sg) in enumerate(population) if not log_is_valid(seed_path(out_dir, i), s, sg)]
     need_base = not log_is_valid(base_path, None, 0.0)
+    if args.max_new_seeds is not None:
+        pending = pending[:args.max_new_seeds]
     log.info(f"{len(population) - len(pending)} seeds already done, {len(pending)} to run")
 
     if not args.aggregate_only and (pending or need_base):
@@ -368,6 +377,7 @@ def main(args):
             # The base run also warms the engine up, so it is not charged to seed 0.
             if need_base:
                 res = run_one(engine, handler, prompts, datas, sampling_params, args.train_samples, None, 0.0)
+                res["cuda_graphs"] = args.cuda_graphs
                 write_json(base_path, res)
                 log.info(f"base: train_reward={res['train_reward']:.4f} test_acc={res['test_accuracy']:.4f} "
                          f"time={res['timing']['total_s']:.1f}s")
@@ -377,6 +387,7 @@ def main(args):
                 seed, sigma = population[i]
                 res = run_one(engine, handler, prompts, datas, sampling_params, args.train_samples, seed, sigma)
                 res["index"] = i
+                res["cuda_graphs"] = args.cuda_graphs
                 write_json(seed_path(out_dir, i), res)
                 elapsed = time.perf_counter() - loop_start
                 eta = elapsed / (n_done + 1) * (len(pending) - n_done - 1)

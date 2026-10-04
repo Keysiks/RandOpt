@@ -16,7 +16,7 @@ class RandOptNcclLLM(LLM):
         super().__init__(*args, **kwargs)
 
 
-def launch_engines(num_engines: int, model_name: str, precision: str = "bfloat16", batch_size: int = 25, tensor_parallel_size: int = 1, enable_prefix_caching: bool = False, gpu_memory_utilization: float = 0.75, multimodal: bool = False):
+def launch_engines(num_engines: int, model_name: str, precision: str = "bfloat16", batch_size: int = 25, tensor_parallel_size: int = 1, enable_prefix_caching: bool = False, gpu_memory_utilization: float = 0.75, multimodal: bool = False, enforce_eager: bool = True):
     """Launch vLLM engines on Ray with batched initialization.
     
     Args:
@@ -26,6 +26,8 @@ def launch_engines(num_engines: int, model_name: str, precision: str = "bfloat16
         batch_size: Number of engines to initialize per batch (reduces NFS contention)
         tensor_parallel_size: Number of GPUs per engine for tensor parallelism (for large models)
         multimodal: Whether to enable multimodal support (for VL models with images)
+        enforce_eager: True disables torch.compile and CUDA graphs (default, original behaviour);
+            False enables them for faster decoding
     
     Returns:
         Tuple of (engines list, placement groups list)
@@ -104,7 +106,7 @@ def launch_engines(num_engines: int, model_name: str, precision: str = "bfloat16
             worker_extension_cls="utils.worker_extn.WorkerExtension",
             dtype=precision,
             enable_prefix_caching=enable_prefix_caching,
-            enforce_eager=True,
+            enforce_eager=enforce_eager,
             gpu_memory_utilization=gpu_memory_utilization,
             disable_log_stats=True,
         )
