@@ -242,6 +242,31 @@ class WorkerExtension:
         torch.cuda.empty_cache()
         return True
     
+    def apply_linear_combination(self, seeds, coeffs):
+        """W = W_base + sum_i coeffs[i] * eps(seeds[i]), eps as in perturb/apply_perturbation.
+
+        Terms are added one by one in the model dtype with the same arithmetic as
+        apply_perturbation, so a single non-zero coefficient reproduces that perturbation exactly.
+        """
+        if not hasattr(self, '_base_weights'):
+            raise RuntimeError("Must call store_base_weights first")
+        for name, p in self.model_runner.model.named_parameters():
+            p.data.copy_(self._base_weights[name])
+            if not self._should_perturb(name):
+                continue
+            for seed, coeff in zip(seeds, coeffs):
+                if coeff == 0:
+                    continue
+                gen = torch.Generator(device=p.device)
+                gen.manual_seed(int(seed))
+                noise = torch.randn(p.shape, dtype=p.dtype, device=p.device, generator=gen)
+                p.data.add_(float(coeff) * noise)
+                del noise
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        return True
+
     def reset_to_base_weights(self):
         """Reset model weights to stored base weights."""
         if not hasattr(self, '_base_weights'):
