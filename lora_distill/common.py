@@ -70,7 +70,7 @@ def chunks(items, size):
 
 
 def add_engine_args(p, tp=1, base_on_cpu=False, gpu_memory_utilization=0.85, max_num_seqs=256):
-    p.add_argument("--model_name", required=True)
+    p.add_argument("--model_name", default=None, help="set by each script (p.set_defaults) unless given")
     p.add_argument("--tp", type=int, default=tp)
     p.add_argument("--base_on_cpu", action="store_true", default=base_on_cpu)
     p.add_argument("--gpu_memory_utilization", type=float, default=gpu_memory_utilization)
