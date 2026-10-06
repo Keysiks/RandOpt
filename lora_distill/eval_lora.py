@@ -25,6 +25,8 @@ def main():
     p.add_argument("--max_tokens", type=int, default=1024)
     p.add_argument("--max_lora_rank", type=int, default=16)
     p.add_argument("--gpu_memory_utilization", type=float, default=0.85)
+    p.add_argument("--full_math500", action="store_true",
+                   help="also evaluate on all 500 MATH-500 problems (use when none of them was used for training)")
     args = p.parse_args()
     os.chdir(REPO_ROOT)
     os.environ.setdefault("VLLM_NO_USAGE_STATS", "1")
@@ -44,6 +46,10 @@ def main():
                                     meta["train_samples"], meta["test_samples"])
         handlers[name] = handler
         tests[name] = [(j, datas[j]) for j in m["test_idx"]]
+    if args.full_math500:
+        handler = get_dataset_handler("math500")
+        datas, _ = ev.load_problems(handler, handler.default_train_path, handler.default_test_path, 0, None)
+        handlers["math500_all"], tests["math500_all"] = handler, list(enumerate(datas))
     tok = AutoTokenizer.from_pretrained(args.model_name)
     prompts = [tok.apply_chat_template(d["messages"], add_generation_prompt=True, tokenize=False)
                for name in tests for _, d in tests[name]]
@@ -81,10 +87,10 @@ def main():
         print(f"{vname if vname != 'base' else args.model_name.split('/')[-1] + ' (no LoRA)':<24}" +
               "".join(f"{results[vname][n]['accuracy'] * 100:>13.1f}%" for n in names))
     ref = results["teacher_32b"]
-    print(f"{'Qwen2.5-32B base':<24}" + "".join(f"{ref[n]['base_accuracy'] * 100:>13.1f}%" for n in names))
-    for key in sorted({k for n in names for k in ref[n] if k.startswith("top")}, key=lambda s: int(s[3:].split('_')[0])):
-        print(f"{'32B ' + key.replace('_vote_accuracy', ' vote'):<24}" +
-              "".join(f"{ref[n][key] * 100:>13.1f}%" if key in ref[n] else f"{'-':>14}" for n in names))
+    cell = lambda n, key: f"{ref[n][key] * 100:>13.1f}%" if key in ref.get(n, {}) else f"{'-':>14}"
+    print(f"{'Qwen2.5-32B base':<24}" + "".join(cell(n, "base_accuracy") for n in names))
+    for key in sorted({k for n in ref for k in ref[n] if k.startswith("top")}, key=lambda s: int(s[3:].split('_')[0])):
+        print(f"{'32B ' + key.replace('_vote_accuracy', ' vote'):<24}" + "".join(cell(n, key) for n in names))
     print("test sizes: " + ", ".join(f"{n}={len(tests[n])}" for n in names))
 
 
