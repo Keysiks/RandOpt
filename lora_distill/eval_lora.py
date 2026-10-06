@@ -9,6 +9,7 @@ Writes <build_dir>/eval/eval_results.json and generations/<variant>_<dataset>.js
 import argparse
 import json
 import os
+import random
 import sys
 
 import numpy as np
@@ -25,6 +26,9 @@ def main():
     p.add_argument("--max_tokens", type=int, default=1024)
     p.add_argument("--max_lora_rank", type=int, default=16)
     p.add_argument("--gpu_memory_utilization", type=float, default=0.85)
+    p.add_argument("--repeats", type=int, default=1,
+                   help="evaluate every variant this many times with differently ordered prompts: the batch "
+                        "composition changes bf16 greedy results by +-2-3 points, so report the mean and the range")
     p.add_argument("--full_math500", action="store_true",
                    help="also evaluate on all 500 MATH-500 problems (use when none of them was used for training)")
     args = p.parse_args()
@@ -65,32 +69,51 @@ def main():
     os.makedirs(os.path.join(out_dir, "generations"), exist_ok=True)
     results = {}
     for vname, lora in variants:
-        outputs = llm.generate(prompts, sp, lora_request=lora, use_tqdm=False)
-        start, results[vname] = 0, {}
+        results[vname] = {}
+        per_repeat = {name: [] for name in tests}
+        for rep in range(args.repeats):
+            order = list(range(len(prompts)))
+            if rep:                                   # repeat 0 keeps the original order
+                random.Random(rep).shuffle(order)
+            shuffled = llm.generate([prompts[i] for i in order], sp, lora_request=lora, use_tqdm=False)
+            outputs = [None] * len(prompts)
+            for pos, i in enumerate(order):
+                outputs[i] = shuffled[pos]
+            start = 0
+            for name in tests:
+                datas = [d for _, d in tests[name]]
+                recs = ev.build_records(handlers[name], outputs[start:start + len(datas)], datas)
+                start += len(datas)
+                per_repeat[name].append(float(np.mean([r["correct"] for r in recs])))
+                if rep == 0:
+                    with open(os.path.join(out_dir, "generations", f"{vname}_{name}.jsonl"), "w", encoding="utf-8") as f:
+                        for (j, _), r in zip(tests[name], recs):
+                            f.write(json.dumps({"idx": j, **r}, ensure_ascii=False) + "\n")
+                    results[vname][name] = {"n": len(recs), "truncated": int(sum(r["finish_reason"] == "length" for r in recs))}
         for name in tests:
-            datas = [d for _, d in tests[name]]
-            recs = ev.build_records(handlers[name], outputs[start:start + len(datas)], datas)
-            start += len(datas)
-            with open(os.path.join(out_dir, "generations", f"{vname}_{name}.jsonl"), "w", encoding="utf-8") as f:
-                for (j, _), r in zip(tests[name], recs):
-                    f.write(json.dumps({"idx": j, **r}, ensure_ascii=False) + "\n")
-            results[vname][name] = {"accuracy": float(np.mean([r["correct"] for r in recs])), "n": len(recs),
-                                    "truncated": int(sum(r["finish_reason"] == "length" for r in recs))}
+            accs = per_repeat[name]
+            results[vname][name].update(accuracy=float(np.mean(accs)), accuracy_repeats=accs,
+                                        accuracy_min=min(accs), accuracy_max=max(accs))
     results["teacher_32b"] = {name: m["teacher_reference_on_test"] for name, m in meta["datasets"].items()}
     with open(os.path.join(out_dir, "eval_results.json"), "w", encoding="utf-8") as f:
         json.dump(results, f, indent=1)
 
     names = list(tests)
     print("\n" + "=" * 70)
-    print(f"{'model':<24}" + "".join(f"{n:>14}" for n in names))
+    width = 22 if args.repeats > 1 else 14
+    print(f"{'model':<30}" + "".join(f"{n:>{width}}" for n in names) + (f"   (mean of {args.repeats} orders, min-max)" if args.repeats > 1 else ""))
     for vname, _ in variants:
-        print(f"{vname if vname != 'base' else args.model_name.split('/')[-1] + ' (no LoRA)':<24}" +
-              "".join(f"{results[vname][n]['accuracy'] * 100:>13.1f}%" for n in names))
+        cells = []
+        for n in names:
+            r = results[vname][n]
+            cells.append(f"{r['accuracy'] * 100:5.1f}% ({r['accuracy_min'] * 100:4.1f}-{r['accuracy_max'] * 100:4.1f})".rjust(width)
+                         if args.repeats > 1 else f"{r['accuracy'] * 100:>13.1f}%")
+        print(f"{vname if vname != 'base' else args.model_name.split('/')[-1] + ' (no LoRA)':<30}" + "".join(cells))
     ref = results["teacher_32b"]
-    cell = lambda n, key: f"{ref[n][key] * 100:>13.1f}%" if key in ref.get(n, {}) else f"{'-':>14}"
-    print(f"{'Qwen2.5-32B base':<24}" + "".join(cell(n, "base_accuracy") for n in names))
+    cell = lambda n, key: f"{ref[n][key] * 100:>{width - 1}.1f}%" if key in ref.get(n, {}) else f"{'-':>{width}}"
+    print(f"{'Qwen2.5-32B base':<30}" + "".join(cell(n, "base_accuracy") for n in names))
     for key in sorted({k for n in ref for k in ref[n] if k.startswith("top")}, key=lambda s: int(s[3:].split('_')[0])):
-        print(f"{'32B ' + key.replace('_vote_accuracy', ' vote'):<24}" + "".join(cell(n, key) for n in names))
+        print(f"{'32B ' + key.replace('_vote_accuracy', ' vote'):<30}" + "".join(cell(n, key) for n in names))
     print("test sizes: " + ", ".join(f"{n}={len(tests[n])}" for n in names))
 
 
