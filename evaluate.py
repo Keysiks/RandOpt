@@ -562,9 +562,11 @@ def main(args):
         pending = pending[:args.max_new_seeds]
     log.info(f"{len(population) - len(pending)} seeds already done, {len(pending)} to run")
 
+    child_failed = False
     if spawn_children and (pending or need_base):
         t_start = time.perf_counter()
         codes = run_children(args)
+        child_failed = any(codes)
         wall = time.perf_counter() - t_start
         log.info(f"all {args.procs_per_gpu} processes finished (exit codes {codes}) in {wall:.0f}s wall")
         log_throughput(benches[0].dir, pending)
@@ -629,6 +631,8 @@ def main(args):
         summary["this_invocation_wall_s"] = wall
         write_json(os.path.join(b.dir, "summary.json"), summary)
         print_summary(summary, b.name)
+    if child_failed:  # a supervisor must see the failure; a rerun skips the finished seeds
+        sys.exit("some worker processes failed")
 
 
 if __name__ == "__main__":
