@@ -48,9 +48,9 @@ log = logging.getLogger("evaluate")
 
 # Keys of args.json that must match when resuming into an existing out_dir.
 RESUME_KEYS = ("model_name", "population_size", "sigma_values", "global_seed",
-               "max_tokens", "train_samples", "precision", "dataset", "tp", "test_samples")
+               "max_tokens", "train_samples", "precision", "dataset", "tp", "test_samples", "population_file")
 # values of keys that older args.json files do not have
-RESUME_DEFAULTS = {"dataset": "math500", "tp": 1, "test_samples": None}
+RESUME_DEFAULTS = {"dataset": "math500", "tp": 1, "test_samples": None, "population_file": None}
 
 
 # -----------------------------------------------------------------------------
@@ -69,6 +69,9 @@ def parse_args():
     p.add_argument("--test_samples", type=int, default=None,
                    help="cap on test problems (None = all; for MATH-500 all means the 300 after the train ones)")
     p.add_argument("--population_size", type=int, default=500, help="number of seeds")
+    p.add_argument("--population_file", default=None,
+                   help="json list of {\"seed\": .., \"sigma\": ..} to run INSTEAD of the generated population "
+                        "(e.g. the best seeds of another dataset, with their original sigmas); order is kept")
     p.add_argument("--sigma_values", default="0.001,0.002,0.003", help="sigma set from the paper (Table 3)")
     p.add_argument("--top_k", default="1,5,25,50", help="ensemble sizes for the summary")
     p.add_argument("--max_tokens", type=int, default=1024)
@@ -109,6 +112,11 @@ def parse_args():
     if args.procs_per_gpu > 1 or args.tp > 1 or args.base_on_cpu:
         args.engine = "direct"
     args.dataset_list = [n.strip() for n in args.dataset.split(",") if n.strip()]
+    args.population = None
+    if args.population_file:
+        args.population = load_population(args.population_file)
+        args.population_size = len(args.population)
+        args.sigma_list = sorted({sg for _, sg in args.population})
     args.sigma_list = [float(s) for s in args.sigma_values.split(",")]
     args.top_k_list = sorted({int(k) for k in args.top_k.split(",")})
     return args
@@ -134,6 +142,15 @@ def write_json(path: str, obj):
 def read_json(path: str):
     with open(path, encoding="utf-8") as f:
         return json.load(f)
+
+
+def load_population(path: str):
+    """[(seed, sigma)] from a json list of {"seed", "sigma"} dicts or [seed, sigma] pairs."""
+    items = read_json(path)
+    pop = [(int(x["seed"]), float(x["sigma"])) if isinstance(x, dict) else (int(x[0]), float(x[1])) for x in items]
+    if len({s for s, _ in pop}) != len(pop):
+        sys.exit(f"{path} lists a seed twice")
+    return pop
 
 
 def make_population(n: int, sigmas: List[float], global_seed: int):
@@ -505,7 +522,7 @@ def main(args):
         sys.exit("--train_data_path / --test_data_path work with a single --dataset only")
 
     args_path = os.path.join(out_dir, "args.json")
-    cfg = {k: v for k, v in vars(args).items() if k not in ("aggregate_only", "dataset_list")}
+    cfg = {k: v for k, v in vars(args).items() if k not in ("aggregate_only", "dataset_list", "population")}
     if os.path.exists(args_path):
         prev = read_json(args_path)
         diff = [k for k in RESUME_KEYS if prev.get(k, RESUME_DEFAULTS.get(k)) != cfg.get(k)]
@@ -527,7 +544,7 @@ def main(args):
                  "ground_truth": d["ground_truth"], "subject": d.get("subject", ""), "level": d.get("level", "")}
                 for i, d in enumerate(b.datas)])
 
-    population = make_population(args.population_size, args.sigma_list, args.global_seed)
+    population = args.population or make_population(args.population_size, args.sigma_list, args.global_seed)
 
     def seed_ok(b, i):
         return log_is_valid(seed_path(b.dir, i), *population[i])
