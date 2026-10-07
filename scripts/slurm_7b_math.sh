@@ -1,7 +1,8 @@
 #!/bin/bash
 # RandOpt on MATH-500 with the protocol of the paper (Neural Thickets): N perturbations, only sigma = 0.001 here,
 # selection on the 200 train problems, top-K majority vote on the 300 test problems; one engine per GPU.
-#   sbatch scripts/slurm_7b_math.sh                     # Qwen2.5-7B-Instruct, N=5000, K=50, 4 GPUs
+#   sbatch scripts/slurm_7b_math.sh                     # Qwen2.5-7B-Instruct, N=300 seeds, each on all 500 problems
+#   FULL=0 N=5000 sbatch scripts/slurm_7b_math.sh       # the paper's two-phase protocol (see below)
 #   sbatch --gres=gpu:8 scripts/slurm_7b_math.sh        # the number of GPUs is taken from the allocation
 #   N=1000 sbatch scripts/slurm_7b_math.sh              # a smaller population (also K=, SIGMA=, MODEL=, OUT=)
 #   MODEL=allenai/Olmo-3-7B-Instruct sbatch scripts/slurm_7b_math.sh   # the paper's 7B model
@@ -21,7 +22,8 @@ export PYTHONUNBUFFERED=1
 
 MODEL=${MODEL:-Qwen/Qwen2.5-7B-Instruct}
 TAG=$(basename "$MODEL" | tr 'A-Z' 'a-z')
-N=${N:-5000}
+N=${N:-300}
+FULL=${FULL:-1}       # 1: every seed on all 500 problems, one phase; 0: the paper's two phases (train only, then the best K)
 K=${K:-50}
 SIGMA=${SIGMA:-0.001}
 GPUS=${GPUS:-${SLURM_GPUS_ON_NODE:-$(echo "${CUDA_VISIBLE_DEVICES:-0}" | tr ',' '\n' | grep -c .)}}
@@ -32,6 +34,14 @@ echo "[7b] model=$MODEL N=$N K=$K sigma=$SIGMA GPUs=$GPUS out=$OUT"
 COMMON=(--dataset math500 --model_name "$MODEL" --sigma_values "$SIGMA" --train_samples 200 --max_tokens 1024
         --precision bfloat16 --global_seed 42 --cuda_graphs --max_num_seqs 512 --gpu_memory_utilization 0.6
         --num_gpus "$GPUS" --stagger_s 30)
+
+if [[ "$FULL" == "1" ]]; then
+  PROGRESS_DIR="$OUT/full" PROGRESS_GLOB='*/seeds/seed_*.json' STALL_MIN=${STALL_MIN:-45} \
+    bash scripts/supervise.sh python evaluate.py "${COMMON[@]}" --population_size "$N" --top_k "1,5,25,$K" \
+      --out_dir "$OUT/full" || exit 1
+  echo "[7b] results: $OUT/full/summary.json (base, every seed on 500 problems, top-K votes on the 300 test problems)"
+  exit 0
+fi
 
 PROGRESS_DIR="$OUT/phase1_train" PROGRESS_GLOB='*/seeds/seed_*.json' STALL_MIN=${STALL_MIN:-45} \
   bash scripts/supervise.sh python evaluate.py "${COMMON[@]}" --population_size "$N" --train_only \
