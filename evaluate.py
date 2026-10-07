@@ -48,9 +48,10 @@ log = logging.getLogger("evaluate")
 
 # Keys of args.json that must match when resuming into an existing out_dir.
 RESUME_KEYS = ("model_name", "population_size", "sigma_values", "global_seed",
-               "max_tokens", "train_samples", "precision", "dataset", "tp", "test_samples", "population_file")
+               "max_tokens", "train_samples", "precision", "dataset", "tp", "test_samples", "population_file",
+               "train_only")
 # values of keys that older args.json files do not have
-RESUME_DEFAULTS = {"dataset": "math500", "tp": 1, "test_samples": None, "population_file": None}
+RESUME_DEFAULTS = {"dataset": "math500", "tp": 1, "test_samples": None, "population_file": None, "train_only": False}
 
 
 # -----------------------------------------------------------------------------
@@ -100,6 +101,12 @@ def parse_args():
                    help="k>1 runs k direct-engine processes on the same GPU, process j takes the seeds with "
                         "index %% k == j and gets gpu_memory_utilization/k (the copy of the base weights comes "
                         "on top of that); implies --engine direct")
+    p.add_argument("--num_gpus", type=int, default=1,
+                   help="data parallel over this many GPUs (taken from CUDA_VISIBLE_DEVICES): one engine process per GPU "
+                        "(times --procs_per_gpu), the seeds are split between them; implies --engine direct")
+    p.add_argument("--train_only", action="store_true",
+                   help="evaluate only the TRAIN problems of every seed (selection phase of the paper's protocol); run the "
+                        "test problems afterwards for the best seeds only (--population_file)")
     p.add_argument("--prefix_caching", action="store_true", help="direct engine only: vLLM prefix caching")
     p.add_argument("--stagger_s", type=float, default=60.0,
                    help="delay between starting processes when procs_per_gpu > 1 (vLLM memory profiling races otherwise)")
@@ -109,7 +116,9 @@ def parse_args():
     args = p.parse_args()
     if args.procs_per_gpu > 1 and args.tp > 1:
         p.error("--procs_per_gpu > 1 cannot be combined with --tp > 1")
-    if args.procs_per_gpu > 1 or args.tp > 1 or args.base_on_cpu:
+    if args.num_gpus > 1 and args.tp > 1:
+        p.error("--num_gpus > 1 (data parallel) cannot be combined with --tp > 1")
+    if args.procs_per_gpu > 1 or args.num_gpus > 1 or args.tp > 1 or args.base_on_cpu:
         args.engine = "direct"
     args.dataset_list = [n.strip() for n in args.dataset.split(",") if n.strip()]
     args.population = None
@@ -188,6 +197,9 @@ def load_bench(name: str, args, root: str, multi: bool) -> Bench:
     train_path = (None if multi else args.train_data_path) or handler.default_train_path
     test_path = (None if multi else args.test_data_path) or handler.default_test_path
     datas, splits = load_problems(handler, train_path, test_path, args.train_samples, args.test_samples)
+    if args.train_only:
+        n_train = splits.count("train")
+        datas, splits = datas[:n_train], splits[:n_train]
     directory = os.path.join(root, name) if multi else root
     os.makedirs(os.path.join(directory, "seeds"), exist_ok=True)
     return Bench(name, handler, datas, splits, directory)
@@ -333,15 +345,29 @@ def shard_pending(pending: List[int], shard: Optional[str]) -> List[int]:
     return [i for i in pending if i % k == j]
 
 
+def visible_gpus(n: int) -> List[str]:
+    """The first n GPU ids of CUDA_VISIBLE_DEVICES (what Slurm gave the job), or 0..n-1."""
+    env = os.environ.get("CUDA_VISIBLE_DEVICES")
+    devices = [d.strip() for d in env.split(",") if d.strip()] if env else [str(i) for i in range(n)]
+    if len(devices) < n:
+        sys.exit(f"--num_gpus {n} but only {len(devices)} GPU(s) visible ({env!r})")
+    return devices[:n]
+
+
 def run_children(args) -> List[int]:
-    """Start procs_per_gpu copies of this script (one shard each) and wait for them."""
+    """One process per (GPU, slot): num_gpus GPUs x procs_per_gpu processes, process j takes the seeds with
+    index % total == j and runs on GPU j % num_gpus. The processes of one GPU start --stagger_s apart (vLLM's memory
+    profiling races otherwise); different GPUs start together."""
+    total = args.num_gpus * args.procs_per_gpu
+    devices = visible_gpus(args.num_gpus)
     children = []
-    for j in range(args.procs_per_gpu):
-        cmd = [sys.executable, os.path.join(REPO_ROOT, "evaluate.py"), *sys.argv[1:],
-               "--shard", f"{j}/{args.procs_per_gpu}"]
-        children.append(subprocess.Popen(cmd))
-        log.info(f"started process {j + 1}/{args.procs_per_gpu}")
-        if j + 1 < args.procs_per_gpu:
+    for slot in range(args.procs_per_gpu):
+        for g in range(args.num_gpus):
+            j = slot * args.num_gpus + g
+            cmd = [sys.executable, os.path.join(REPO_ROOT, "evaluate.py"), *sys.argv[1:], "--shard", f"{j}/{total}"]
+            children.append(subprocess.Popen(cmd, env={**os.environ, "CUDA_VISIBLE_DEVICES": devices[g]}))
+            log.info(f"started process {j + 1}/{total} on GPU {devices[g]}")
+        if slot + 1 < args.procs_per_gpu:
             time.sleep(args.stagger_s)
     return [c.wait() for c in children]
 
@@ -433,6 +459,11 @@ def log_is_valid(path: str, seed: Optional[int], sigma: float) -> bool:
 # Aggregation from logs: timing + top-K majority vote (selection on train, vote on test)
 # -----------------------------------------------------------------------------
 
+def pct(x) -> str:
+    """Accuracy as text, 'n/a' when there are no test problems (--train_only)."""
+    return "n/a" if x is None else f"{x:.4f}"
+
+
 def stats(xs: List[float]) -> dict:
     return {"mean": statistics.fmean(xs), "median": statistics.median(xs), "min": min(xs), "max": max(xs)}
 
@@ -462,7 +493,8 @@ def aggregate(handler, args, datas, out_dir: str, n_train: int) -> dict:
         "all_seeds_total_s": sum(totals),
         "all_seeds_total_h": sum(totals) / 3600,
     }
-    summary["single_seed_test_accuracy"] = stats([s["test_accuracy"] for s in seeds])
+    if all(s["test_accuracy"] is not None for s in seeds):
+        summary["single_seed_test_accuracy"] = stats([s["test_accuracy"] for s in seeds])
     summary["sigma_stats"] = {
         str(sg): {"n": len(v), "mean_train_reward": statistics.fmean(v)}
         for sg in args.sigma_list
@@ -483,6 +515,8 @@ def aggregate(handler, args, datas, out_dir: str, n_train: int) -> dict:
                 final = Counter(votes).most_common(1)[0][0]
                 correct += answer_correct(handler, final, datas[idx]["ground_truth"])
         n_test = len(datas) - ts
+        if n_test == 0:  # train-only logs: nothing to vote on
+            continue
         ensemble[str(k)] = {"accuracy": correct / n_test, "correct": correct, "n_test": n_test,
                             "seeds": [s["seed"] for s in top]}
     summary["ensemble"] = ensemble
@@ -494,14 +528,15 @@ def print_summary(summary: dict, name: str = ""):
     log.info(f"SUMMARY{' ' + name if name else ''}: {summary['n_seeds_done']}/{summary['n_seeds_total']} seeds")
     if "base" in summary:
         b = summary["base"]
-        log.info(f"base: train_reward={b['train_reward']:.4f} test_acc={b['test_accuracy']:.4f} "
+        log.info(f"base: train_reward={b['train_reward']:.4f} test_acc={pct(b['test_accuracy'])} "
                  f"time={b['timing']['total_s']:.1f}s")
     if "timing" in summary:
         t = summary["timing"]["one_seed_total_s"]
         log.info(f"one seed: mean={t['mean']:.1f}s median={t['median']:.1f}s min={t['min']:.1f}s max={t['max']:.1f}s")
         log.info(f"all seeds: {summary['timing']['all_seeds_total_s']:.0f}s ({summary['timing']['all_seeds_total_h']:.2f}h)")
-        s = summary["single_seed_test_accuracy"]
-        log.info(f"single-seed test acc: mean={s['mean']:.4f} max={s['max']:.4f}")
+        if "single_seed_test_accuracy" in summary:
+            s = summary["single_seed_test_accuracy"]
+            log.info(f"single-seed test acc: mean={s['mean']:.4f} max={s['max']:.4f}")
     for k, v in summary.get("ensemble", {}).items():
         log.info(f"  top-{k} majority vote: test acc={v['accuracy']*100:.2f}% ({v['correct']}/{v['n_test']})")
 
@@ -554,7 +589,7 @@ def main(args):
 
     pending = [i for i in range(len(population)) if not all(seed_ok(b, i) for b in benches)]
     need_base = not all(base_ok(b) for b in benches)
-    spawn_children = args.procs_per_gpu > 1 and not args.shard and not args.aggregate_only
+    spawn_children = args.procs_per_gpu * args.num_gpus > 1 and not args.shard and not args.aggregate_only
     if args.shard:
         pending = shard_pending(pending, args.shard)
         need_base = need_base and args.shard.startswith("0/")
@@ -594,7 +629,7 @@ def main(args):
                     if not base_ok(b):  # keep logs that are already valid
                         write_json(os.path.join(b.dir, "base.json"), res)
                     log.info(f"base {b.name}: train_reward={res['train_reward']:.4f} "
-                             f"test_acc={res['test_accuracy']:.4f} time={res['timing']['total_s']:.1f}s")
+                             f"test_acc={pct(res['test_accuracy'])} time={res['timing']['total_s']:.1f}s")
 
             loop_start = time.perf_counter()
             for n_done, i in enumerate(pending):
@@ -611,7 +646,7 @@ def main(args):
                 eta = elapsed / (n_done + 1) * (len(pending) - n_done - 1)
                 t = results[benches[0].name]["timing"]
                 scores = " | ".join(f"{b.name} train={results[b.name]['train_reward']:.3f} "
-                                    f"test={results[b.name]['test_accuracy']:.3f}" for b in benches)
+                                    f"test={pct(results[b.name]['test_accuracy'])}" for b in benches)
                 log.info(f"[{i + 1}/{len(population)}] seed={seed} sigma={sigma} {scores} "
                          f"time={t['total_s']:.1f}s (perturb {t['perturb_s']:.1f} / gen {t['generate_s']:.1f}) "
                          f"elapsed={elapsed / 60:.1f}m eta={eta / 60:.1f}m")
