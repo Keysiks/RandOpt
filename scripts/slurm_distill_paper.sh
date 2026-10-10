@@ -25,5 +25,5 @@ OUT=${OUT:-logs/distill_paper_3b}
 python lora_distill/build_paper_distill_dataset.py --logs "$LOGS" --out_dir "$OUT" --top_k 50
 python lora_distill/train_lora.py --train_file "$OUT/train.jsonl" --out_dir "$OUT/lora" \
     --lr 1e-4 --epochs 2 --batch_size 40 --r 64 --alpha 128 --dropout 0.05
-python lora_distill/eval_lora.py --build_dir "$OUT" --repeats 3 --teacher_label Qwen2.5-3B \
+python lora_distill/eval_lora.py --build_dir "$OUT" --repeats 3 --teacher_label Qwen2.5-3B --max_lora_rank 64 \
     --adapters "$OUT/lora/epoch_1,$OUT/lora/epoch_2"
