@@ -26,6 +26,8 @@ def main():
     p.add_argument("--max_tokens", type=int, default=1024)
     p.add_argument("--max_lora_rank", type=int, default=16)
     p.add_argument("--gpu_memory_utilization", type=float, default=0.85)
+    p.add_argument("--teacher_label", default="Qwen2.5-32B",
+                   help="name of the reference model in meta.json's teacher_reference_on_test, only for the printed table")
     p.add_argument("--repeats", type=int, default=1,
                    help="evaluate every variant this many times with differently ordered prompts: the batch "
                         "composition changes bf16 greedy results by +-2-3 points, so report the mean and the range")
@@ -111,9 +113,9 @@ def main():
         print(f"{vname if vname != 'base' else args.model_name.split('/')[-1] + ' (no LoRA)':<30}" + "".join(cells))
     ref = results["teacher_32b"]
     cell = lambda n, key: f"{ref[n][key] * 100:>{width - 1}.1f}%" if key in ref.get(n, {}) else f"{'-':>{width}}"
-    print(f"{'Qwen2.5-32B base':<30}" + "".join(cell(n, "base_accuracy") for n in names))
+    print(f"{args.teacher_label + ' base':<30}" + "".join(cell(n, "base_accuracy") for n in names))
     for key in sorted({k for n in ref for k in ref[n] if k.startswith("top")}, key=lambda s: int(s[3:].split('_')[0])):
-        print(f"{'32B ' + key.replace('_vote_accuracy', ' vote'):<30}" + "".join(cell(n, key) for n in names))
+        print(f"{args.teacher_label + ' ' + key.replace('_vote_accuracy', ' vote'):<30}" + "".join(cell(n, key) for n in names))
     print("test sizes: " + ", ".join(f"{n}={len(tests[n])}" for n in names))
 
 
