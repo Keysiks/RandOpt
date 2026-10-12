@@ -1,0 +1,41 @@
+experiment	variant	dataset	accuracy %	min %	max %	test problems	truncated	training examples	run dir
+32B->3B первый (482 примера, r16, 3 эпохи)	no LoRA (base)	math500	63.0			200	25	482	logs/lora_32b_to_3b
+32B->3B первый (482 примера, r16, 3 эпохи)	no LoRA (base)	gsm8k	80.4			500	2	482	logs/lora_32b_to_3b
+32B->3B первый (482 примера, r16, 3 эпохи)	epoch_1	math500	63.5			200	13	482	logs/lora_32b_to_3b
+32B->3B первый (482 примера, r16, 3 эпохи)	epoch_1	gsm8k	80.6			500	1	482	logs/lora_32b_to_3b
+32B->3B первый (482 примера, r16, 3 эпохи)	epoch_2	math500	62.0			200	14	482	logs/lora_32b_to_3b
+32B->3B первый (482 примера, r16, 3 эпохи)	epoch_2	gsm8k	80.6			500	2	482	logs/lora_32b_to_3b
+32B->3B первый (482 примера, r16, 3 эпохи)	epoch_3	math500	59.5			200	19	482	logs/lora_32b_to_3b
+32B->3B первый (482 примера, r16, 3 эпохи)	epoch_3	gsm8k	79.4			500	0	482	logs/lora_32b_to_3b
+32B->3B первый (482 примера, r16, 3 эпохи)	reference base	math500	74.0						logs/lora_32b_to_3b
+32B->3B первый (482 примера, r16, 3 эпохи)	reference top1 vote	math500	75.5						logs/lora_32b_to_3b
+32B->3B первый (482 примера, r16, 3 эпохи)	reference top5 vote	math500	79.5						logs/lora_32b_to_3b
+32B->3B первый (482 примера, r16, 3 эпохи)	reference top25 vote	math500	84.0						logs/lora_32b_to_3b
+32B->3B первый (482 примера, r16, 3 эпохи)	reference top50 vote	math500	84.0						logs/lora_32b_to_3b
+32B->3B первый (482 примера, r16, 3 эпохи)	reference base	gsm8k	88.4						logs/lora_32b_to_3b
+32B->3B первый (482 примера, r16, 3 эпохи)	reference top1 vote	gsm8k	91.6						logs/lora_32b_to_3b
+32B->3B первый (482 примера, r16, 3 эпохи)	reference top5 vote	gsm8k	93.2						logs/lora_32b_to_3b
+32B->3B первый (482 примера, r16, 3 эпохи)	reference top25 vote	gsm8k	93.2						logs/lora_32b_to_3b
+32B->3B первый (482 примера, r16, 3 эпохи)	reference top50 vote	gsm8k	93.6						logs/lora_32b_to_3b
+32B->3B масштабный (трудные задачи MATH+GSM8K train)	no LoRA (base)	math500	60.5			200	30	2475	logs/distill_big
+32B->3B масштабный (трудные задачи MATH+GSM8K train)	no LoRA (base)	gsm8k	83.0			500	1	2475	logs/distill_big
+32B->3B масштабный (трудные задачи MATH+GSM8K train)	no LoRA (base)	math500_all	62.2			500	64	2475	logs/distill_big
+32B->3B масштабный (трудные задачи MATH+GSM8K train)	epoch_1	math500	63.0			200	21	2475	logs/distill_big
+32B->3B масштабный (трудные задачи MATH+GSM8K train)	epoch_1	gsm8k	82.8			500	2	2475	logs/distill_big
+32B->3B масштабный (трудные задачи MATH+GSM8K train)	epoch_1	math500_all	61.0			500	45	2475	logs/distill_big
+32B->3B масштабный (трудные задачи MATH+GSM8K train)	epoch_2	math500	62.5			200	15	2475	logs/distill_big
+32B->3B масштабный (трудные задачи MATH+GSM8K train)	epoch_2	gsm8k	82.2			500	1	2475	logs/distill_big
+32B->3B масштабный (трудные задачи MATH+GSM8K train)	epoch_2	math500_all	60.8			500	39	2475	logs/distill_big
+32B->3B масштабный (трудные задачи MATH+GSM8K train)	epoch_3	math500	60.5			200	16	2475	logs/distill_big
+32B->3B масштабный (трудные задачи MATH+GSM8K train)	epoch_3	gsm8k	81.2			500	1	2475	logs/distill_big
+32B->3B масштабный (трудные задачи MATH+GSM8K train)	epoch_3	math500_all	60.4			500	48	2475	logs/distill_big
+32B->3B масштабный (трудные задачи MATH+GSM8K train)	reference base	math500	74.0						logs/distill_big
+32B->3B масштабный (трудные задачи MATH+GSM8K train)	reference top1 vote	math500	75.5						logs/distill_big
+32B->3B масштабный (трудные задачи MATH+GSM8K train)	reference top5 vote	math500	79.5						logs/distill_big
+32B->3B масштабный (трудные задачи MATH+GSM8K train)	reference top25 vote	math500	84.0						logs/distill_big
+32B->3B масштабный (трудные задачи MATH+GSM8K train)	reference top50 vote	math500	84.0						logs/distill_big
+32B->3B масштабный (трудные задачи MATH+GSM8K train)	reference base	gsm8k	88.4						logs/distill_big
+32B->3B масштабный (трудные задачи MATH+GSM8K train)	reference top1 vote	gsm8k	91.6						logs/distill_big
+32B->3B масштабный (трудные задачи MATH+GSM8K train)	reference top5 vote	gsm8k	93.2						logs/distill_big
+32B->3B масштабный (трудные задачи MATH+GSM8K train)	reference top25 vote	gsm8k	93.2						logs/distill_big
+32B->3B масштабный (трудные задачи MATH+GSM8K train)	reference top50 vote	gsm8k	93.6						logs/distill_big

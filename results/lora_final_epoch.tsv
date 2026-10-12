@@ -1,0 +1,6 @@
+experiment	training examples	dataset	test problems	3B no LoRA %	3B after last epoch (epoch 3) %	change, pp	truncated no LoRA	truncated epoch 3	32B base %	32B top-50 vote %
+LoRA на смеси MATH-500+GSM8K (482 примера, r16, 3 эпохи) [logs/lora_32b_to_3b]	482	math500 (200 test)	200	63.0	59.5	-3.5	25	19	74.0	84.0
+LoRA на смеси MATH-500+GSM8K (482 примера, r16, 3 эпохи) [logs/lora_32b_to_3b]	482	gsm8k (500 test)	500	80.4	79.4	-1.0	2	0	88.4	93.6
+Масштабная LoRA, трудные задачи MATH train+GSM8K train (2475 примеров) [logs/distill_big]	2475	math500 (200 test)	200	60.5	60.5	+0.0	30	16	74.0	84.0
+Масштабная LoRA, трудные задачи MATH train+GSM8K train (2475 примеров) [logs/distill_big]	2475	gsm8k (500 test)	500	83.0	81.2	-1.8	1	1	88.4	93.6
+Масштабная LoRA, трудные задачи MATH train+GSM8K train (2475 примеров) [logs/distill_big]	2475	math500_all (все 500 задач)	500	62.2	60.4	-1.8	64	48		

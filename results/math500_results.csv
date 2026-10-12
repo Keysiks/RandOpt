@@ -1,0 +1,4 @@
+model,run dir,seeds,sigma,base test acc %,base full acc %,single seed mean test %,single seed best test %,top-1 vote test %,top-5 vote test %,top-25 vote test %,top-50 vote test %,test problems,sec / seed (mean),sec / seed (median),"sum of seed times, h","base run, s"
+Qwen2.5-3B,logs/math500_qwen2.5-3b-instruct_n500,500,0.001/0.002/0.003,61.0,61.4,50.4,62.7,61.3,66.3,69.7,69.0,300,32.4,30.8,4.50,43.0
+Qwen2.5-7B,logs/qwen2.5-7b-instruct_math500_sigma0.001_n300/full,300,0.001,65.7,67.6,65.9,72.0,66.7,73.0,75.3,76.3,300,37.6,37.5,3.13,37.0
+Qwen2.5-32B,logs/qwen2.5-32b_math500_gsm8k/math500,500,0.001/0.002/0.003,70.7,72.6,71.1,77.3,71.0,76.7,80.0,80.7,300,152.6,152.1,21.19,146.4
